@@ -4,9 +4,9 @@ bitget_websocket.py — Bitget WebSocket public feed for real-time market data.
 Subscribes to public channels:
   - ticker — price updates
   - candle (1H) — 1-hour candle updates
-  - funding-rate — funding rate changes
+  - fundingRate — funding rate changes (futures only)
 
-Uses thread-safe queue to pipe updates to the main loop.
+Uses thread-safe dict cache of latest tickers.
 Automatic reconnect with exponential backoff on connection loss.
 Zero auth required — public market data only.
 
@@ -14,13 +14,13 @@ Design:
   - Long-lived connection in a daemon thread
   - Thread-safe dict cache of latest tickers
   - Graceful shutdown hook
+  - Application-level ping/pong heartbeat handling
 """
 
 import json
 import logging
 import threading
 import time
-from collections import defaultdict
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -28,15 +28,14 @@ import websocket
 
 from config import (
     WHITELIST_SYMBOLS,
-    REQUEST_TIMEOUT_SECONDS,
     PRODUCT_TYPE,
 )
 
 log = logging.getLogger("bitget_websocket")
 
-# Bitget public WebSocket endpoint
-BITGET_WS_URL = "wss://ws.bitget.com/spot/v1/public"
-BITGET_FUTURES_WS_URL = "wss://ws.bitget.com/mix/v1/public"
+# Bitget public WebSocket endpoint (v2 unified for both Spot and Futures)
+# Use instType in subscription to distinguish: "SPOT" or "USDT-FUTURES"
+BITGET_WS_URL = "wss://ws.bitget.com/v2/ws/public"
 
 # Reconnect parameters
 INITIAL_BACKOFF = 1.0  # seconds
@@ -106,84 +105,95 @@ class BitgetWebSocketClient:
 
     def _connect_and_listen(self):
         """Establish WebSocket connection and listen for messages."""
-        ws_url = BITGET_FUTURES_WS_URL if PRODUCT_TYPE == "USDT-FUTURES" else BITGET_WS_URL
-        
+        # Always use v2 unified public endpoint; PRODUCT_TYPE controls instType in subs
+        ws_url = BITGET_WS_URL
+
         self.ws = websocket.WebSocketApp(
             ws_url,
+            on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
             on_close=self._on_close,
         )
-        
-        # Subscribe to channels
-        self._subscribe()
-        
-        # Run until shutdown or error
+
+        # Run until shutdown or error. ping_interval helps keep connection alive at TCP level.
+        # We also handle application-level "ping"/"pong" strings per Bitget docs.
         self.ws.run_forever(
-            dispatcher=websocket.threading.ThreadingClientConnectionDispatcher(),
-            ping_interval=30,
+            ping_interval=25,
+            ping_timeout=10,
             ping_payload="",
         )
 
+    def _on_open(self, ws):
+        """Called when WebSocket connection is established. Subscribe here."""
+        log.info("WebSocket connection opened to %s", BITGET_WS_URL)
+        self._backoff = INITIAL_BACKOFF  # reset backoff on successful connect
+        self._subscribe()
+
     def _subscribe(self):
-        """Send subscription requests for ticker and candle channels."""
-        # Subscribe to tickers
-        for symbol in self.symbols:
-            msg = {
-                "op": "subscribe",
-                "args": [
-                    {
-                        "instType": PRODUCT_TYPE,
-                        "channel": "ticker",
-                        "instId": symbol,
-                    }
-                ],
-            }
-            try:
-                self.ws.send(json.dumps(msg))
-                log.debug("Subscribed to ticker: %s", symbol)
-            except Exception as e:
-                log.warning("Failed to subscribe to ticker %s: %s", symbol, e)
+        """Send batched subscription requests for ticker, candle1H, and fundingRate channels."""
+        if not self.ws:
+            log.warning("Cannot subscribe: WebSocket not initialized")
+            return
 
-        # Subscribe to 1H candles
-        for symbol in self.symbols:
-            msg = {
-                "op": "subscribe",
-                "args": [
-                    {
-                        "instType": PRODUCT_TYPE,
-                        "channel": "candle1H",
-                        "instId": symbol,
-                    }
-                ],
-            }
-            try:
-                self.ws.send(json.dumps(msg))
-                log.debug("Subscribed to candle1H: %s", symbol)
-            except Exception as e:
-                log.warning("Failed to subscribe to candle1H %s: %s", symbol, e)
+        # Prepare batched args (much more efficient than one message per symbol)
+        ticker_args = []
+        candle_args = []
+        funding_args = []
 
-        # Subscribe to funding rates (futures only)
-        if PRODUCT_TYPE == "USDT-FUTURES":
-            for symbol in self.symbols:
-                msg = {
-                    "op": "subscribe",
-                    "args": [
-                        {
-                            "instType": PRODUCT_TYPE,
-                            "channel": "fundingRate",
-                            "instId": symbol,
-                        }
-                    ],
-                }
-                try:
-                    self.ws.send(json.dumps(msg))
-                    log.debug("Subscribed to fundingRate: %s", symbol)
-                except Exception as e:
-                    log.warning("Failed to subscribe to fundingRate %s: %s", symbol, e)
+        for symbol in self.symbols:
+            ticker_args.append({
+                "instType": PRODUCT_TYPE,
+                "channel": "ticker",
+                "instId": symbol,
+            })
+            candle_args.append({
+                "instType": PRODUCT_TYPE,
+                "channel": "candle1H",
+                "instId": symbol,
+            })
+            if PRODUCT_TYPE == "USDT-FUTURES":
+                funding_args.append({
+                    "instType": PRODUCT_TYPE,
+                    "channel": "fundingRate",
+                    "instId": symbol,
+                })
+
+        # Send batched subscribes (max ~3 messages instead of 3*N)
+        if ticker_args:
+            self._safe_send({"op": "subscribe", "args": ticker_args}, "ticker")
+
+        if candle_args:
+            self._safe_send({"op": "subscribe", "args": candle_args}, "candle1H")
+
+        if funding_args:
+            self._safe_send({"op": "subscribe", "args": funding_args}, "fundingRate")
+
+    def _safe_send(self, msg: dict, desc: str):
+        """Helper to safely send a subscription message."""
+        try:
+            self.ws.send(json.dumps(msg))
+            log.debug("Subscribed to %s (%d symbols)", desc, len(msg.get("args", [])))
+        except Exception as e:
+            log.warning("Failed to subscribe to %s: %s", desc, e)
 
     def _on_message(self, ws, message: str):
-        """Process incoming WebSocket message."""
+        """Process incoming WebSocket message (handles both JSON and plain ping/pong)."""
+        message = message.strip()
+
+        # Application-level heartbeat per Bitget docs (string "ping"/"pong")
+        if message == "pong":
+            log.debug("Received pong heartbeat from server")
+            return
+        if message == "ping":
+            try:
+                ws.send("pong")
+                log.debug("Responded to server ping with pong")
+            except Exception as e:
+                log.warning("Failed to send pong response: %s", e)
+            return
+
+        # Parse JSON messages
         try:
             data = json.loads(message)
         except json.JSONDecodeError as e:
@@ -191,6 +201,9 @@ class BitgetWebSocketClient:
             return
 
         if "data" not in data:
+            # Could be subscribe success {"event":"subscribe", "arg":...} or error — ignore for now
+            if data.get("event") == "error":
+                log.warning("WebSocket error event: %s", data)
             return
 
         event_data = data.get("data", [])
@@ -233,7 +246,7 @@ class BitgetWebSocketClient:
         log.debug("Ticker %s: %s", symbol, ticker_data.get("lastPr"))
 
     def _handle_candle(self, symbol: str, candle_data: dict):
-        """Log candle update (for debugging; main loop uses REST API)."""
+        """Log candle update (for debugging; main loop uses REST API for candles)."""
         log.debug(
             "Candle 1H %s: close=%s, vol=%s",
             symbol,
@@ -243,20 +256,21 @@ class BitgetWebSocketClient:
 
     def _handle_funding_rate(self, symbol: str, rate_data: dict):
         """Log funding rate update."""
-        log.debug(
-            "Funding rate %s: %s%%",
-            symbol,
-            float(rate_data.get("fundingRate", 0)) * 100,
-        )
+        try:
+            rate = float(rate_data.get("fundingRate", 0)) * 100
+        except (TypeError, ValueError):
+            rate = 0.0
+        log.debug("Funding rate %s: %.4f%%", symbol, rate)
 
     def _on_error(self, ws, error):
         """Handle WebSocket error."""
         log.error("WebSocket error: %s", error)
 
     def _on_close(self, ws, close_status_code, close_msg):
-        """Handle WebSocket close."""
-        log.warning("WebSocket closed: %s %s", close_status_code, close_msg)
-        self._backoff = INITIAL_BACKOFF  # Reset backoff on close
+        """Handle WebSocket close. Triggers reconnect in _run loop."""
+        log.warning("WebSocket closed: status=%s msg=%s", close_status_code, close_msg)
+        # Backoff will be applied in the reconnect loop; reset here for clean reconnects
+        self._backoff = INITIAL_BACKOFF
 
 
 # Global WebSocket client instance
