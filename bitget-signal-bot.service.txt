@@ -1,0 +1,19 @@
+[Unit]
+Description=Bitget Futures Signal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bitget-signal-bot
+EnvironmentFile=/opt/bitget-signal-bot/.env
+ExecStart=/opt/bitget-signal-bot/venv/bin/python3 main.py
+Restart=on-failure
+RestartSec=15
+User=botuser
+Group=botuser
+# Give systemd 30s to let the bot shut down cleanly (WAL checkpoint etc)
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
