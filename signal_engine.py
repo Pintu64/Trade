@@ -1,5 +1,5 @@
 """
-signal_engine.py — Multi-factor signal generation.
+signal_engine.py — Multi-factor signal generation with professional formatting.
 
 A signal only fires when ALL confirmation layers agree:
   1. Higher-timeframe trend (4H EMA crossover)
@@ -8,12 +8,17 @@ A signal only fires when ALL confirmation layers agree:
   4. Breakout of recent high/low on a volume spike
   5. Funding rate within safe range (not an overcrowded trade)
 
-Every signal carries ATR-based SL/TP levels and a reward:risk ratio.
+Every signal carries:
+  - Multiple take profit levels (TP1, TP2, TP3)
+  - ATR-based SL/TP levels
+  - Position sizing recommendations
+  - Leverage suggestions
+  - Detailed risk metrics
+
 No orders are placed — this is a signal/alert system only.
 """
 
 import logging
-from dataclasses import dataclass, field
 from typing import Optional
 
 import pandas as pd
@@ -23,30 +28,16 @@ from config import (
     RSI_OVERBOUGHT, RSI_OVERSOLD,
     VOLUME_SPIKE_MULTIPLIER,
     MAX_ABS_FUNDING_RATE,
-    ATR_STOP_MULTIPLIER, ATR_TARGET_MULTIPLIER,
-    MAX_LEVERAGE_SUGGESTED,
+    ATR_STOP_MULTIPLIER,
+    ACCOUNT_RISK_PERCENT,
 )
+from signal_formatter import build_professional_signal, ProfessionalSignal
 
 log = logging.getLogger("signal_engine")
 
 # Minimum number of candles required before we trust indicator values.
 # Below this the EWM warmup period means readings are unreliable.
 MIN_CANDLES_REQUIRED = 60
-
-
-@dataclass
-class Signal:
-    symbol:            str
-    direction:         str        # "LONG" or "SHORT"
-    entry:             float
-    stop_loss:         float
-    take_profit:       float
-    reward_risk:       float
-    funding_rate:      float
-    suggested_leverage: int
-    rsi:               float
-    atr:               float
-    confidence_notes:  list = field(default_factory=list)
 
 
 def _higher_tf_trend(trend_df: pd.DataFrame) -> Optional[str]:
@@ -66,23 +57,59 @@ def _higher_tf_trend(trend_df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def evaluate_symbol(
-    symbol:       str,
-    signal_df:    pd.DataFrame,
-    trend_df:     pd.DataFrame,
-    funding_rate: float,
-) -> Optional[Signal]:
+def _calculate_breakout_strength(
+    close: float,
+    recent_high: float,
+    recent_low: float,
+    curr_volume: float,
+    avg_volume: float,
+) -> float:
     """
-    Runs all signal filters for one symbol.
+    Calculate breakout strength (0.0-1.0) based on proximity to extreme
+    and volume confirmation.
+    
+    Returns:
+        Strength score 0.0-1.0
+    """
+    if avg_volume <= 0:
+        return 0.0
+    
+    price_range = recent_high - recent_low
+    if price_range <= 0:
+        return 0.0
+    
+    # How far into the range is the close? (0.0 = recent_low, 1.0 = recent_high)
+    price_position = (close - recent_low) / price_range
+    price_position = max(0.0, min(1.0, price_position))
+    
+    # Volume confirmation (ratio capped at 2.0)
+    volume_ratio = min(curr_volume / avg_volume if avg_volume > 0 else 1.0, 2.0)
+    volume_strength = (volume_ratio - 1.0) / 1.0  # Normalize to 0.0-1.0
+    
+    # Combined strength
+    strength = (price_position + volume_strength) / 2.0
+    return strength
+
+
+def evaluate_symbol(
+    symbol: str,
+    signal_df: pd.DataFrame,
+    trend_df: pd.DataFrame,
+    funding_rate: float,
+    account_balance: float = 10000,
+) -> Optional[ProfessionalSignal]:
+    """
+    Runs all signal filters for one symbol and generates a professional signal.
 
     Args:
         symbol:       Trading pair, e.g. "BTCUSDT"
         signal_df:    Enriched lower-TF candle DataFrame (e.g. 1H)
         trend_df:     Enriched higher-TF candle DataFrame (e.g. 4H)
         funding_rate: Current perpetual funding rate (decimal, e.g. 0.0001)
+        account_balance: Account size for position sizing
 
     Returns:
-        Signal dataclass if all filters pass, else None.
+        ProfessionalSignal if all filters pass, else None.
     """
     # ── Warmup guard ─────────────────────────────────────────────────────────
     if len(signal_df) < MIN_CANDLES_REQUIRED or len(trend_df) < MIN_CANDLES_REQUIRED:
@@ -96,7 +123,6 @@ def evaluate_symbol(
         log.debug("%s skipped: higher-TF trend is flat/undefined", symbol)
         return None
 
-    notes = []
     last = signal_df.iloc[-1]
 
     # ── Filter 2: Lower timeframe EMA alignment ───────────────────────────────
@@ -112,24 +138,17 @@ def evaluate_symbol(
                   symbol, lf_direction, trend)
         return None
 
-    notes.append(
-        f"EMA{EMA_FAST}/{EMA_SLOW} aligned on both 4H and 1H timeframes ({trend})"
-    )
-
     # ── Filter 3: RSI not extended ────────────────────────────────────────────
     rsi = last["rsi"]
     if pd.isna(rsi):
         return None
 
-    if trend == "LONG"  and rsi >= RSI_OVERBOUGHT:
+    if trend == "LONG" and rsi >= RSI_OVERBOUGHT:
         log.debug("%s skipped: RSI=%.1f overbought for LONG", symbol, rsi)
         return None
     if trend == "SHORT" and rsi <= RSI_OVERSOLD:
         log.debug("%s skipped: RSI=%.1f oversold for SHORT", symbol, rsi)
         return None
-
-    notes.append(f"RSI={rsi:.1f} — not extended ({'below' if trend == 'LONG' else 'above'} "
-                 f"{'overbought' if trend == 'LONG' else 'oversold'} threshold)")
 
     # ── Filter 4: Breakout + volume spike ────────────────────────────────────
     close        = last["close"]
@@ -152,11 +171,6 @@ def evaluate_symbol(
                 symbol, breakout, close, recent_high, volume_spike, curr_volume, avg_volume,
             )
             return None
-        notes.append(
-            f"Bullish breakout above {recent_high:.6f} — "
-            f"volume {curr_volume:.0f} vs avg {avg_volume:.0f} "
-            f"({curr_volume/avg_volume:.1f}x spike)"
-        )
     else:  # SHORT
         breakout = close < recent_low
         if not (breakout and volume_spike):
@@ -165,11 +179,11 @@ def evaluate_symbol(
                 symbol, breakout, close, recent_low, volume_spike, curr_volume, avg_volume,
             )
             return None
-        notes.append(
-            f"Bearish breakout below {recent_low:.6f} — "
-            f"volume {curr_volume:.0f} vs avg {avg_volume:.0f} "
-            f"({curr_volume/avg_volume:.1f}x spike)"
-        )
+
+    # Calculate breakout strength
+    breakout_strength = _calculate_breakout_strength(
+        close, recent_high, recent_low, curr_volume, avg_volume
+    )
 
     # ── Filter 5: Funding rate ────────────────────────────────────────────────
     if abs(funding_rate) > MAX_ABS_FUNDING_RATE:
@@ -177,12 +191,13 @@ def evaluate_symbol(
                  symbol, funding_rate * 100, MAX_ABS_FUNDING_RATE * 100)
         return None
 
-    funding_direction = "positive" if funding_rate > 0 else ("negative" if funding_rate < 0 else "neutral")
-    notes.append(
-        f"Funding rate {funding_rate * 100:.3f}% ({funding_direction}) — within safe range"
-    )
+    funding_favorable = abs(funding_rate) < MAX_ABS_FUNDING_RATE
+    if trend == "LONG":
+        funding_favorable = funding_favorable and funding_rate >= 0
+    else:
+        funding_favorable = funding_favorable and funding_rate <= 0
 
-    # ── ATR-based SL / TP ────────────────────────────────────────────────────
+    # ── ATR-based SL ─────────────────────────────────────────────────────────
     atr = last["atr"]
     if pd.isna(atr) or atr <= 0:
         log.debug("%s skipped: ATR is NaN or zero", symbol)
@@ -190,36 +205,35 @@ def evaluate_symbol(
 
     entry = close
     if trend == "LONG":
-        stop_loss   = entry - atr * ATR_STOP_MULTIPLIER
-        take_profit = entry + atr * ATR_TARGET_MULTIPLIER
+        stop_loss = entry - atr * ATR_STOP_MULTIPLIER
     else:
-        stop_loss   = entry + atr * ATR_STOP_MULTIPLIER
-        take_profit = entry - atr * ATR_TARGET_MULTIPLIER
+        stop_loss = entry + atr * ATR_STOP_MULTIPLIER
 
-    risk   = abs(entry - stop_loss)
-    reward = abs(take_profit - entry)
-
-    if risk <= 0:
-        log.debug("%s skipped: computed risk distance is zero", symbol)
-        return None
-
-    reward_risk = reward / risk
-
-    notes.append(
-        f"ATR={atr:.6f} → SL {ATR_STOP_MULTIPLIER}×ATR, "
-        f"TP {ATR_TARGET_MULTIPLIER}×ATR → R:R {reward_risk:.2f}"
-    )
-
-    return Signal(
+    # ── Build professional signal ────────────────────────────────────────────
+    professional_signal = build_professional_signal(
         symbol=symbol,
         direction=trend,
         entry=entry,
         stop_loss=stop_loss,
-        take_profit=take_profit,
-        reward_risk=reward_risk,
-        funding_rate=funding_rate,
-        suggested_leverage=MAX_LEVERAGE_SUGGESTED,
+        atr=atr,
         rsi=float(rsi),
-        atr=float(atr),
-        confidence_notes=notes,
+        ema_direction=trend,
+        volume_spike=volume_spike,
+        funding_rate=funding_rate,
+        funding_threshold=MAX_ABS_FUNDING_RATE,
+        breakout_strength=breakout_strength,
+        account_balance=account_balance,
     )
+
+    log.info(
+        "SIGNAL %s %s  entry=%s  SL=%s  TP1=%s  TP2=%s  TP3=%s  confidence=%.0f%%",
+        professional_signal.direction, symbol,
+        professional_signal.entry,
+        professional_signal.stop_loss,
+        professional_signal.tp_levels[0].price if len(professional_signal.tp_levels) > 0 else "N/A",
+        professional_signal.tp_levels[1].price if len(professional_signal.tp_levels) > 1 else "N/A",
+        professional_signal.tp_levels[2].price if len(professional_signal.tp_levels) > 2 else "N/A",
+        professional_signal.confidence_score,
+    )
+
+    return professional_signal
