@@ -36,10 +36,17 @@ def _env_float(name, default):
         raise ConfigError(f"Env var {name}={val!r} must be a float.")
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
+# ── Telegram ────────────────────────────────────────────────────────────[...]
 TELEGRAM_BOT_TOKEN = _env_str("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = _env_str("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED   = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+# ── Bitget API Authentication (optional) ────────────────────────────────────
+# Leave empty to run in signals-only mode (no orders placed)
+BITGET_API_KEY     = _env_str("BITGET_API_KEY", "")
+BITGET_API_SECRET  = _env_str("BITGET_API_SECRET", "")
+BITGET_PASSPHRASE  = _env_str("BITGET_PASSPHRASE", "")
+BITGET_AUTH_ENABLED = bool(BITGET_API_KEY and BITGET_API_SECRET and BITGET_PASSPHRASE)
 
 # ── Bitget public REST ────────────────────────────────────────────────────────
 BITGET_BASE_URL              = _env_str("BITGET_BASE_URL", "https://api.bitget.com")
@@ -60,10 +67,10 @@ WHITELIST_SYMBOLS = [
     if s.strip()
 ]
 
-# ── Liquidity gate ────────────────────────────────────────────────────────────
+# ── Liquidity gate ──────────────────────────────────────────────────────────[...]
 MIN_24H_QUOTE_VOLUME_USDT = _env_float("MIN_24H_QUOTE_VOLUME_USDT", 20_000_000)
 
-# ── Timeframes ────────────────────────────────────────────────────────────────
+# ── Timeframes ────────────────────────────────────────────────────────[...]
 TREND_TIMEFRAME  = _env_str("TREND_TIMEFRAME",  "4H")
 SIGNAL_TIMEFRAME = _env_str("SIGNAL_TIMEFRAME", "1H")
 CANDLE_LIMIT     = _env_int("CANDLE_LIMIT", 200)
@@ -72,7 +79,7 @@ VALID_GRANULARITIES = {
     "1m","3m","5m","15m","30m","1H","4H","6H","12H","1D","3D","1W","1M",
 }
 
-# ── Indicators ────────────────────────────────────────────────────────────────
+# ── Indicators ────────────────────────────────────────────────────────[...]
 EMA_FAST                = _env_int("EMA_FAST", 20)
 EMA_SLOW                = _env_int("EMA_SLOW", 50)
 RSI_PERIOD              = _env_int("RSI_PERIOD", 14)
@@ -91,16 +98,23 @@ ATR_TARGET_MULTIPLIER  = _env_float("ATR_TARGET_MULTIPLIER", 2.5)
 ACCOUNT_RISK_PERCENT   = _env_float("ACCOUNT_RISK_PERCENT", 1.0)
 MAX_LEVERAGE_SUGGESTED = _env_int("MAX_LEVERAGE_SUGGESTED", 5)
 
+# ── Order Management (when BITGET_AUTH_ENABLED = true) ──────────────────────
+ENABLE_AUTO_ORDERS     = _env_str("ENABLE_AUTO_ORDERS", "false").lower() in ("true", "1", "yes")
+AUTO_ORDER_TYPE        = _env_str("AUTO_ORDER_TYPE", "limit")  # "limit" or "market"
+AUTO_ORDER_LEVERAGE    = _env_int("AUTO_ORDER_LEVERAGE", 3)
+AUTO_ORDER_MARGIN_MODE = _env_str("AUTO_ORDER_MARGIN_MODE", "isolated")  # "isolated" or "crossed"
+POSITION_SIZE_PERCENT  = _env_float("POSITION_SIZE_PERCENT", 2.0)  # % of account balance per position
+
 # ── Polling & cooldowns ───────────────────────────────────────────────────────
 POLL_INTERVAL_SECONDS             = _env_int("POLL_INTERVAL_SECONDS", 900)
 MIN_MINUTES_BETWEEN_REPEAT_SIGNAL = _env_int("MIN_MINUTES_BETWEEN_REPEAT_SIGNAL", 240)
 SCAN_ERROR_BACKOFF_SECONDS        = _env_int("SCAN_ERROR_BACKOFF_SECONDS", 30)
 
-# ── Database ──────────────────────────────────────────────────────────────────
+# ── Database ────────────────────────────────────────────────────────[...]
 DB_PATH                 = _env_str("DB_PATH", "signal_bot.db")
 DB_BUSY_TIMEOUT_SECONDS = _env_int("DB_BUSY_TIMEOUT_SECONDS", 30)
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────────────[...]
 LOG_FILE         = _env_str("LOG_FILE", "signal_bot.log")
 LOG_LEVEL        = _env_str("LOG_LEVEL", "INFO").upper()
 LOG_MAX_BYTES    = _env_int("LOG_MAX_BYTES", 10 * 1024 * 1024)
@@ -161,6 +175,25 @@ def validate():
             f"POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS} too aggressive; minimum 60s."
         )
 
+    # Authentication validation (optional)
+    if BITGET_AUTH_ENABLED:
+        if not (1 <= AUTO_ORDER_LEVERAGE <= 20):
+            errors.append(
+                f"AUTO_ORDER_LEVERAGE={AUTO_ORDER_LEVERAGE} must be 1-20."
+            )
+        if AUTO_ORDER_MARGIN_MODE not in ("isolated", "crossed"):
+            errors.append(
+                f"AUTO_ORDER_MARGIN_MODE={AUTO_ORDER_MARGIN_MODE!r} must be 'isolated' or 'crossed'."
+            )
+        if not (0.1 <= POSITION_SIZE_PERCENT <= 10):
+            errors.append(
+                f"POSITION_SIZE_PERCENT={POSITION_SIZE_PERCENT} should be 0.1-10%."
+            )
+        if ENABLE_AUTO_ORDERS and AUTO_ORDER_TYPE not in ("limit", "market"):
+            errors.append(
+                f"AUTO_ORDER_TYPE={AUTO_ORDER_TYPE!r} must be 'limit' or 'market'."
+            )
+
     if not TELEGRAM_ENABLED:
         log.warning(
             "Telegram not configured. Signals will be logged only — "
@@ -172,4 +205,14 @@ def validate():
             log.error("Config error: %s", e)
         raise ConfigError(f"{len(errors)} config error(s). See log above.")
 
+    # Log configuration status
     log.info("Config OK. Watching: %s", ", ".join(WHITELIST_SYMBOLS))
+    if BITGET_AUTH_ENABLED:
+        log.info(
+            "Bitget authentication configured. Auto-orders: %s (leverage %sx, margin: %s)",
+            "ENABLED" if ENABLE_AUTO_ORDERS else "disabled",
+            AUTO_ORDER_LEVERAGE,
+            AUTO_ORDER_MARGIN_MODE,
+        )
+    else:
+        log.info("Running in signals-only mode (no Bitget auth configured)")
