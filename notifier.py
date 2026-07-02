@@ -1,278 +1,279 @@
 """
-notifier.py — Premium Telegram signal notifications with iPhone 17 Pro Max aesthetic.
+notifier.py — Telegram notification system with professional signal formatting.
 
-Modern glassmorphism design, premium typography, smooth animations,
-and professional trading UI patterns.
+Sends:
+  - Professional multi-TP signals with risk metrics
+  - Trade outcome notifications (TP hit, SL hit, expired)
+  - Performance summaries
+  - Bot status messages
 
-Outbound only — the bot never reads incoming Telegram messages or commands,
-since this is a signals-only system and never places orders.
-
-Features:
-  - Dynamic price precision (BTC shows 2dp, DOGE shows 6dp, sub-cent shows 8dp)
-  - Premium glassmorphic design with gradients
-  - Risk metrics and confidence scoring
-  - Smooth data visualization with Unicode charts
-  - Retry with backoff on transient send failures
-  - Respects Telegram 429 rate-limit Retry-After header
-  - Uses TELEGRAM_ENABLED flag from config instead of string-matching tokens
+Uses Telegram Bot API with retry logic and error handling.
 """
 
-import time
 import logging
-
+import time
 import requests
 
-from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED,
-    ACCOUNT_RISK_PERCENT, REQUEST_TIMEOUT_SECONDS,
-)
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED
+from signal_formatter import ProfessionalSignal, format_professional_signal_text
 
 log = logging.getLogger("notifier")
 
-_API_URL       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-_MAX_RETRIES   = 3
+_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+_MAX_RETRIES = 3
 _RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
 
 def fmt_price(value: float) -> str:
-    """
-    Dynamic decimal precision based on price magnitude.
-    Prevents low-priced coins like DOGE from rounding to 0.0000.
-
-      >= 100        →  2 dp  (BTC: 65432.12)
-      >= 1          →  4 dp  (SOL: 145.3210)
-      >= 0.01       →  6 dp  (DOGE: 0.082345)
-      < 0.01        →  8 dp  (sub-cent tokens)
-    """
-    if value == 0:
-        return "0"
-    abs_v = abs(value)
-    if abs_v >= 1000:
-        dp = 2
-    elif abs_v >= 1:
-        dp = 4
-    elif abs_v >= 0.01:
-        dp = 6
+    """Format price with appropriate decimals."""
+    if value is None:
+        return "N/A"
+    if value >= 1000:
+        return f"${value:,.2f}"
+    elif value >= 1:
+        return f"${value:.4f}"
     else:
-        dp = 8
-    return f"{value:.{dp}f}"
+        return f"${value:.8g}"
 
 
-def _get_confidence_level(rr_ratio: float, rsi: float = 50) -> tuple:
+def _send_raw(text: str, parse_mode: str = "HTML") -> bool:
     """
-    Calculate confidence level and emoji based on risk/reward and indicators.
-    Returns (confidence_pct, emoji, strength_bar)
-    """
-    confidence = 50  # Base 50%
+    Send raw message to Telegram.
     
-    # R:R contribution (max +30%)
-    if rr_ratio >= 2.0:
-        confidence += 30
-    elif rr_ratio >= 1.5:
-        confidence += 20
-    elif rr_ratio >= 1.0:
-        confidence += 10
+    Args:
+        text: Message text (HTML or plain)
+        parse_mode: "HTML" or "Markdown"
     
-    # RSI extremity contribution (max +15%)
-    if 35 <= rsi <= 65:
-        confidence += 15
-    elif 30 <= rsi <= 70:
-        confidence += 8
-    
-    confidence = min(confidence, 99)  # Cap at 99%
-    
-    if confidence >= 80:
-        return confidence, "🔥", "█"  # Hot signal
-    elif confidence >= 65:
-        return confidence, "⚡", "▓"  # Strong
-    elif confidence >= 50:
-        return confidence, "✨", "▒"  # Moderate
-    else:
-        return confidence, "💭", "░"  # Weak
-
-
-def _build_premium_signal_message(signal) -> str:
-    """
-    Premium iPhone 17 glassmorphic design signal message.
-    Modern, minimal, professional trading aesthetic.
-    """
-    direction_emoji = "📈" if signal.direction == "LONG" else "📉"
-    direction_label = "LONG 🟢" if signal.direction == "LONG" else "SHORT 🔴"
-    
-    # Calculate confidence
-    rsi_val = signal.rsi if hasattr(signal, 'rsi') else 50
-    confidence, conf_emoji, strength_char = _get_confidence_level(signal.reward_risk, rsi_val)
-    
-    # Create visual bars
-    filled = int(confidence / 10)
-    empty = 10 - filled
-    confidence_bar = "█" * filled + "░" * empty
-    
-    # Risk reward visualization
-    rr_filled = min(int(signal.reward_risk), 5)
-    rr_bar = "█" * rr_filled
-    
-    # Premium header with glassmorphism
-    header = (
-        f"<b>┏━━━━━━━━━━━━━━━━━━━━━━━┓</b>\n"
-        f"<b>┃  {direction_emoji} {direction_label:15s} ┃</b>\n"
-        f"<b>┃  {signal.symbol:20s} ┃</b>\n"
-        f"<b>┗━━━━━━━━━━━━━━━━━━━━━━━┛</b>"
-    )
-    
-    # Price levels with premium formatting
-    entry_color = "🟢" if signal.direction == "LONG" else "🔴"
-    
-    levels = (
-        f"\n\n<b>💰 PRICE LEVELS</b>\n"
-        f"<code>╭─ Entry Point</code>\n"
-        f"<code>│  {entry_color} ${fmt_price(signal.entry)}</code>\n"
-        f"<code>├─ Stop Loss (Risk Limit)</code>\n"
-        f"<code>│  🛑 ${fmt_price(signal.stop_loss)}</code>\n"
-        f"<code>╰─ Take Profit (Target)</code>\n"
-        f"<code>   🎯 ${fmt_price(signal.take_profit)}</code>"
-    )
-    
-    # Risk metrics section with visual indicators
-    risk_value = abs(signal.entry - signal.stop_loss)
-    reward_value = abs(signal.take_profit - signal.entry)
-    
-    metrics = (
-        f"\n\n<b>📊 TRADE METRICS</b>\n"
-        f"<code>Risk Amount      : ${risk_value:.2f}</code>\n"
-        f"<code>Potential Reward : ${reward_value:.2f}</code>\n"
-        f"<code>Reward:Risk      : {rr_bar:5s} {signal.reward_risk:.2f}:1</code>\n"
-        f"<code>Suggested Leverage: {signal.suggested_leverage}x</code>"
-    )
-    
-    # Confidence indicator with visual bar
-    confidence_section = (
-        f"\n\n<b>{conf_emoji} SIGNAL CONFIDENCE</b>\n"
-        f"<code>[{confidence_bar}]</code>\n"
-        f"<code>Strength: {confidence}% {strength_char * (confidence // 20)}</code>"
-    )
-    
-    # Market conditions
-    funding_pct = signal.funding_rate * 100
-    if funding_pct > 0.05:
-        funding_emoji = "📈"
-        funding_status = "Positive (Longs favored)"
-    elif funding_pct < -0.05:
-        funding_emoji = "📉"
-        funding_status = "Negative (Shorts favored)"
-    else:
-        funding_emoji = "➡️"
-        funding_status = "Neutral"
-    
-    market_conditions = (
-        f"\n\n<b>🌍 MARKET CONDITIONS</b>\n"
-        f"<code>Funding Rate : {funding_emoji} {funding_pct:.3f}%</code>\n"
-        f"<code>Status       : {funding_status}</code>"
-    )
-    
-    # Account risk management
-    account_risk = (
-        f"\n\n<b>⚖️ RISK MANAGEMENT</b>\n"
-        f"<code>Account Risk/Trade : {ACCOUNT_RISK_PERCENT:.1f}%</code>\n"
-        f"<code>Position Sizing    : Your Responsibility</code>"
-    )
-    
-    # Confidence notes with icons (glassmorphic style)
-    notes_header = "\n\n<b>✅ CONFIRMATION FACTORS</b>"
-    notes_formatted = ""
-    icons = ["🔍", "📊", "⚡", "🎯", "💹", "🚀"]
-    for i, note in enumerate(signal.confidence_notes):
-        icon = icons[i % len(icons)]
-        notes_formatted += f"\n<code>{icon} {note}</code>"
-    
-    # Premium footer with gradient separator
-    footer = (
-        f"\n\n<b>┌──────────────────────────┐</b>\n"
-        f"<b>│  ⚠️  DISCLAIMER & RULES   │</b>\n"
-        f"<b>└──────────────────────────┘</b>\n"
-        f"<i>• This is a signal only — not financial advice</i>\n"
-        f"• You execute trades manually at your own risk\n"
-        f"• Always use stop losses for protection\n"
-        f"• Never risk more than 1-2% per trade\n"
-        f"• Leverage carries extreme risk — trade responsibly\n"
-        f"• Past performance ≠ Future results\n\n"
-        f"<b>Good luck! 🚀</b>"
-    )
-    
-    return header + levels + metrics + confidence_section + market_conditions + account_risk + notes_header + notes_formatted + footer
-
-
-def _build_status_message_premium(text: str, status_type: str = "info") -> str:
-    """
-    Premium status message with glassmorphic design.
-    status_type: 'success', 'error', 'info', 'warning'
-    """
-    emoji_map = {
-        "success": "✅",
-        "error": "❌",
-        "info": "ℹ️",
-        "warning": "⚠️",
-        "start": "🚀",
-        "stop": "⛔",
-    }
-    emoji = emoji_map.get(status_type, "ℹ️")
-    
-    return (
-        f"<b>╔════════════════════════════════╗</b>\n"
-        f"<b>║ {emoji:2s}  Status Update          ║</b>\n"
-        f"<b>╚════════════════════════════════╝</b>\n\n"
-        f"{text}\n\n"
-        f"<i>Updated at: {int(time.time())}</i>"
-    )
-
-
-def _send_raw(text: str) -> bool:
-    """
-    Sends one Telegram message with retry/backoff.
-    Returns True on success, False after all retries exhausted.
+    Returns:
+        True if sent successfully, False otherwise
     """
     if not TELEGRAM_ENABLED:
-        log.warning(
-            "Telegram not configured — message not sent. "
-            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to enable. "
-            "Preview (first 200 chars): %s", text[:200]
-        )
+        log.warning("Telegram not enabled, skipping notification")
         return False
-
-    payload = {
-        "chat_id":               TELEGRAM_CHAT_ID,
-        "text":                  text,
-        "parse_mode":            "HTML",
-        "disable_web_page_preview": True,
-    }
-
+    
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            resp = requests.post(_API_URL, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-
-            if resp.status_code == 429:
-                retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-                log.warning("Telegram rate limited — waiting %ss (attempt %s)", retry_after, attempt)
-                time.sleep(retry_after)
-                continue
-
-            resp.raise_for_status()
-            return True
-
-        except requests.RequestException as exc:
-            log.warning("Telegram send failed attempt %s/%s: %s", attempt, _MAX_RETRIES, exc)
-            if attempt < _MAX_RETRIES:
-                time.sleep(_RETRY_BACKOFF * attempt)
-
-    log.error("Gave up sending Telegram message after %s attempts.", _MAX_RETRIES)
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": parse_mode,
+            }
+            resp = requests.post(_API_URL, json=payload, timeout=10)
+            
+            if resp.status_code == 200:
+                log.debug("Telegram message sent (attempt %s)", attempt)
+                return True
+            else:
+                log.warning(
+                    "Telegram API error (attempt %s/%s): %s — %s",
+                    attempt, _MAX_RETRIES, resp.status_code, resp.text,
+                )
+        except requests.RequestException as e:
+            log.warning("Network error sending Telegram message (attempt %s/%s): %s",
+                        attempt, _MAX_RETRIES, e)
+        
+        if attempt < _MAX_RETRIES:
+            sleep_time = _RETRY_BACKOFF * attempt
+            log.debug("Retrying Telegram send in %.1fs", sleep_time)
+            time.sleep(sleep_time)
+    
+    log.error("Failed to send Telegram message after %s attempts", _MAX_RETRIES)
     return False
 
 
-def send_signal(signal) -> bool:
-    """Formats and sends a premium trade signal alert."""
-    return _send_raw(_build_premium_signal_message(signal))
+def send_professional_signal(signal: ProfessionalSignal) -> bool:
+    """
+    Send professional signal with multiple TPs and risk metrics.
+    
+    Args:
+        signal: ProfessionalSignal object
+    
+    Returns:
+        True if sent successfully
+    """
+    if not signal:
+        return False
+    
+    message = format_professional_signal_text(signal)
+    success = _send_raw(message, parse_mode="HTML")
+    
+    if success:
+        log.info("Professional signal sent for %s %s", signal.direction, signal.symbol)
+    else:
+        log.error("Failed to send professional signal for %s", signal.symbol)
+    
+    return success
+
+
+def send_trade_outcome(
+    symbol: str,
+    direction: str,
+    entry: float,
+    exit_price: float,
+    tp_or_sl: str,
+    pnl_r: float,
+) -> bool:
+    """
+    Send trade outcome notification (TP HIT, SL HIT, or EXPIRED).
+    
+    Args:
+        symbol: Trading pair
+        direction: "LONG" or "SHORT"
+        entry: Entry price
+        exit_price: Exit price
+        tp_or_sl: "TP_HIT", "SL_HIT", or "EXPIRED"
+        pnl_r: P&L in risk units
+    
+    Returns:
+        True if sent successfully
+    """
+    direction_label = "📈 LONG" if direction == "LONG" else "📉 SHORT"
+    
+    if tp_or_sl == "TP_HIT":
+        outcome_emoji = "✅"
+        outcome_label = "PROFIT - TP HIT!"
+        outcome_color = "🟢"
+    elif tp_or_sl == "SL_HIT":
+        outcome_emoji = "❌"
+        outcome_label = "LOSS - SL HIT"
+        outcome_color = "🔴"
+    else:  # EXPIRED
+        outcome_emoji = "⏰"
+        outcome_label = "EXPIRED"
+        outcome_color = "⚪"
+    
+    pnl_label = f"+{pnl_r:.2f}R" if pnl_r >= 0 else f"{pnl_r:.2f}R"
+    
+    message = (
+        f"<b>{outcome_emoji} TRADE CLOSED {outcome_color}</b>\n\n"
+        f"<b>{direction_label} {symbol}</b>\n"
+        f"<code>Entry  : {fmt_price(entry)}</code>\n"
+        f"<code>Exit   : {fmt_price(exit_price)}</code>\n"
+        f"<code>Result : {pnl_label}</code>\n\n"
+        f"<b>{outcome_label}</b>"
+    )
+    
+    return _send_raw(message, parse_mode="HTML")
+
+
+def send_performance_summary(summary_data: dict) -> bool:
+    """
+    Send performance summary statistics.
+    
+    Args:
+        summary_data: Dict with keys: total, tp_count, sl_count, avg_r, total_r, win_rate
+    
+    Returns:
+        True if sent successfully
+    """
+    total = summary_data.get("total", 0)
+    tp_count = summary_data.get("tp_count", 0)
+    sl_count = summary_data.get("sl_count", 0)
+    avg_r = summary_data.get("avg_r", 0)
+    total_r = summary_data.get("total_r", 0)
+    win_rate = summary_data.get("win_rate", 0)
+    
+    message = (
+        f"<b>📊 PERFORMANCE SUMMARY</b>\n\n"
+        f"<code>Closed Trades: {total}</code>\n"
+        f"<code>✅ TP Hits   : {tp_count}</code>\n"
+        f"<code>❌ SL Hits   : {sl_count}</code>\n"
+        f"<code>Win Rate    : {win_rate:.1f}%</code>\n\n"
+        f"<code>Avg Win     : +{avg_r:.2f}R</code>\n"
+        f"<code>Net Result  : {total_r:+.2f}R</code>\n\n"
+        f"<b>Keep up the discipline! 🚀</b>"
+    )
+    
+    return _send_raw(message, parse_mode="HTML")
+
+
+def send_status_message(message_text: str, status_type: str = "info") -> bool:
+    """
+    Send bot status message (startup, error, etc).
+    
+    Args:
+        message_text: Message content
+        status_type: "start", "stop", "error", "info", "warning"
+    
+    Returns:
+        True if sent successfully
+    """
+    if status_type == "start":
+        emoji = "✅"
+        title = "BOT STARTED"
+    elif status_type == "stop":
+        emoji = "⛔"
+        title = "BOT STOPPED"
+    elif status_type == "error":
+        emoji = "⚠️"
+        title = "ERROR"
+    elif status_type == "warning":
+        emoji = "🚨"
+        title = "WARNING"
+    else:
+        emoji = "ℹ️"
+        title = "INFO"
+    
+    message = (
+        f"<b>{emoji} {title}</b>\n\n"
+        f"{message_text}"
+    )
+    
+    return _send_raw(message, parse_mode="HTML")
+
+
+def send_startup_notification(config_info: str) -> bool:
+    """
+    Send bot startup notification with configuration summary.
+    
+    Args:
+        config_info: Configuration summary text
+    
+    Returns:
+        True if sent successfully
+    """
+    message = (
+        f"<b>✅ BITGET SIGNAL BOT ONLINE</b>\n\n"
+        f"<b>🤖 Bot Status</b>\n"
+        f"<code>Status: Ready to scan</code>\n"
+        f"<code>Mode: Futures (USDT-FUTURES)</code>\n\n"
+        f"<b>⚙️  Configuration</b>\n"
+        f"{config_info}\n\n"
+        f"<b>📡 Awaiting market opportunities...</b>\n"
+        f"<i>Signals will appear here as they're detected</i>"
+    )
+    
+    return _send_raw(message, parse_mode="HTML")
+
+
+def send_error_notification(error_message: str, context: str = "") -> bool:
+    """
+    Send error notification.
+    
+    Args:
+        error_message: Error description
+        context: Additional context (e.g., symbol, function name)
+    
+    Returns:
+        True if sent successfully
+    """
+    context_str = f"\n<code>Context: {context}</code>" if context else ""
+    
+    message = (
+        f"<b>⚠️  BOT ERROR</b>\n\n"
+        f"<code>Error: {error_message}</code>{context_str}\n\n"
+        f"<i>Check logs for details. The bot will attempt to recover.</i>"
+    )
+    
+    return _send_raw(message, parse_mode="HTML")
+
+
+# Convenience function for backward compatibility
+def send_signal(signal: ProfessionalSignal) -> bool:
+    """Legacy function name — calls send_professional_signal."""
+    return send_professional_signal(signal)
 
 
 def send_status(text: str, status_type: str = "info") -> bool:
-    """Sends a premium status/info message (startup, shutdown, errors)."""
-    return _send_raw(_build_status_message_premium(text, status_type))
+    """Legacy function name — calls send_status_message."""
+    return send_status_message(text, status_type)
