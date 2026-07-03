@@ -200,6 +200,10 @@ class BitgetWebSocketClient:
             log.warning("Invalid JSON from WebSocket: %s", e)
             return
 
+        if not isinstance(data, dict):
+            log.debug("Ignoring non-object WebSocket message: %s", data)
+            return
+
         if "data" not in data:
             # Could be subscribe success {"event":"subscribe", "arg":...} or error — ignore for now
             if data.get("event") == "error":
@@ -226,8 +230,11 @@ class BitgetWebSocketClient:
         elif channel == "fundingRate":
             self._handle_funding_rate(symbol, event_data[0])
 
-    def _handle_ticker(self, symbol: str, ticker_data: dict):
+    def _handle_ticker(self, symbol: str, ticker_data):
         """Cache ticker and call callback if provided."""
+        if not isinstance(ticker_data, dict):
+            log.debug("Unexpected ticker payload for %s: %s", symbol, ticker_data)
+            return
         with self._lock:
             self._ticker_cache[symbol] = {
                 "lastPr": ticker_data.get("lastPr"),
@@ -245,17 +252,25 @@ class BitgetWebSocketClient:
 
         log.debug("Ticker %s: %s", symbol, ticker_data.get("lastPr"))
 
-    def _handle_candle(self, symbol: str, candle_data: dict):
-        """Log candle update (for debugging; main loop uses REST API for candles)."""
-        log.debug(
-            "Candle 1H %s: close=%s, vol=%s",
-            symbol,
-            candle_data.get("c"),
-            candle_data.get("vol"),
-        )
+    def _handle_candle(self, symbol: str, candle_data):
+        """Log candle update (for debugging; main loop uses REST API for candles).
 
-    def _handle_funding_rate(self, symbol: str, rate_data: dict):
+        Bitget sends candle data as a positional list, not a dict:
+        [timestamp, open, high, low, close, baseVolume, quoteVolume, usdtVolume]
+        """
+        if not isinstance(candle_data, (list, tuple)) or len(candle_data) < 6:
+            log.debug("Unexpected candle payload for %s: %s", symbol, candle_data)
+            return
+
+        close = candle_data[4]
+        volume = candle_data[5]
+        log.debug("Candle 1H %s: close=%s, vol=%s", symbol, close, volume)
+
+    def _handle_funding_rate(self, symbol: str, rate_data):
         """Log funding rate update."""
+        if not isinstance(rate_data, dict):
+            log.debug("Unexpected funding rate payload for %s: %s", symbol, rate_data)
+            return
         try:
             rate = float(rate_data.get("fundingRate", 0)) * 100
         except (TypeError, ValueError):
